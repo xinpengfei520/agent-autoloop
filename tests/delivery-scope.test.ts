@@ -1,6 +1,7 @@
 // Failure modes: runtime Markdown, executable/symlink documents, renames, an unknown/divergent live
 // commit or an earlier unreleased code change suppresses Ship; PR settings replace main's settings; HTTP health escapes
 // the explicit localhost-only test switch. Git objects are read without a checkout, hooks, filters or project imports.
+// Reviewers by agent are listed with no account trusted to declare one, or a model or depth becomes a command option.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -36,6 +37,23 @@ test("the default review status is neutral and projects can override it", () => 
     "project-review",
   );
 });
+test("reviewers by agent need trusted accounts, and a model or depth that can't be read as an option", () => {
+  const review = (extra: object) => settings({ ...config, review: { points: "AGENTS.md", ...extra } }).review;
+  assert.deepEqual(review({}).agents, {});
+  const agents = { codex: null, claude: { model: "gpt-6.1-sol", effort: "xhigh" }, gemini: { command: ["reviewer"] } };
+  assert.deepEqual(review({ trusted: [1], agents }).agents, agents);
+  for (const wrong of [
+    { agents: { codex: null } },
+    { trusted: [1.5], agents: { codex: null } },
+    { trusted: [1], agents: { Codex: null } },
+    { trusted: [1], agents: { claude: { model: "--unsafe" } } },
+    { trusted: [1], agents: { claude: { effort: "x high" } } },
+    { trusted: [1], agents: { claude: { model: "gpt-6.1-sol", command: ["reviewer"] } } },
+    { trusted: [1], agents: { claude: ["codex", "codex"] } },
+    { trusted: [1], agents: { claude: { reviewers: 2 } } },
+  ])
+    assert.throws(() => review(wrong));
+});
 write("ops/delivery.json", JSON.stringify(config));
 const base = commit();
 git("update-ref", "refs/remotes/origin/main", base);
@@ -56,8 +74,10 @@ test("release scope compares the entire healthy-live range and both sides of ren
 test("executable or symlink documents and unknown history always need release", () => {
   for (const mode of ["executable", "symlink"]) {
     git("reset", "--hard", base);
-    if (mode === "executable") chmodSync(join(root, "docs/a.md"), 0o755);
-    else {
+    if (mode === "executable") {
+      chmodSync(join(root, "docs/a.md"), 0o755);
+      git("update-index", "--chmod=+x", "docs/a.md");
+    } else {
       rmSync(join(root, "docs/a.md"));
       symlinkSync("../app.ts", join(root, "docs/a.md"));
     }

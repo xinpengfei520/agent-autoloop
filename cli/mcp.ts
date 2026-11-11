@@ -1,12 +1,13 @@
 // `agent-autoloop mcp`: the hub's doors as MCP tools over stdio, using the keys already in this machine's config.json.
-import { createInterface } from "node:readline";
 import { readConfig } from "../host/config.ts";
+import { eachLine } from "../host/lines.ts";
+import { versionName } from "../host/version.ts";
 import { hubClient, type Hub } from "../protocol/client.ts";
 
 const positive = { type: "integer", minimum: 1 };
 const string = { type: "string", minLength: 1 };
 const specs = [
-  ["status", "查看现在的事项和卡片", {}, []],
+  ["status", "查看现在的事项和卡片；before 写上一页的 nextBefore，往前翻更早的轮次", { before: positive }, []],
   ["why", "查看一轮的事件、规则和结果", { run: positive }, ["run"]],
   [
     "answer",
@@ -23,6 +24,9 @@ const specs = [
     ["id", "type"],
   ],
   ["tell", "用本机来源发送通知；相同编号只发一次", { key: string, text: string }, ["key", "text"]],
+  ["pause", "暂停一条规则：到点不跑、来事件不接", { rule: string, reason: string, until: string }, ["rule"]],
+  ["resume", "恢复一条暂停的规则", { rule: string }, ["rule"]],
+  ["run", "立即运行一条规则一轮", { rule: string, subject: string, reason: string }, ["rule"]],
 ] as const;
 
 const usesSourceKey = (name: string) => ["emit", "tell"].includes(name);
@@ -56,7 +60,7 @@ function validArguments(tool: Tool, args: any) {
 function callTool(hub: Hub, name: Tool["name"], args: any) {
   switch (name) {
     case "status":
-      return hub.state();
+      return hub.state(args.before);
     case "why":
       return hub.why(args.run);
     case "answer": {
@@ -71,14 +75,24 @@ function callTool(hub: Hub, name: Tool["name"], args: any) {
       return hub.event(args);
     case "tell":
       return hub.tell(args);
+    case "pause":
+      return hub.pause(args.rule, {
+        ...(args.reason !== undefined && { reason: args.reason }),
+        ...(args.until !== undefined && { until: args.until }),
+      });
+    case "resume":
+      return hub.resume(args.rule);
+    case "run":
+      return hub.run(args.rule, {
+        ...(args.subject !== undefined && { subject: args.subject }),
+        ...(args.reason !== undefined && { reason: args.reason }),
+      });
   }
 }
 
 export async function mcp() {
   const config = readConfig();
   const tools = toolsFor(config);
-  let initialized = false;
-  let ready = false;
   const reply = (id: unknown, body: object) => console.log(JSON.stringify({ jsonrpc: "2.0", id, ...body }));
   const refuse = (id: unknown, code: number, message: string) => reply(id, { error: { code, message } });
 
@@ -95,33 +109,25 @@ export async function mcp() {
     }
   }
 
-  for await (const line of createInterface({ input: process.stdin })) {
+  eachLine(process.stdin, (line) => {
     let request: any;
     try {
       request = JSON.parse(line);
     } catch {
-      refuse(null, -32700, "不是 JSON");
-      continue;
+      return refuse(null, -32700, "不是 JSON");
     }
     if (!request || request.jsonrpc !== "2.0" || typeof request.method !== "string") {
-      refuse(request?.id ?? null, -32600, "请求格式不正确");
-      continue;
+      return refuse(request?.id ?? null, -32600, "请求格式不正确");
     }
     const { id, method, params } = request;
-    if (id === undefined) {
-      if (method === "notifications/initialized" && initialized) ready = true;
-    } else if (method === "initialize") {
-      if (!params?.protocolVersion || !params?.capabilities || !params?.clientInfo) {
-        refuse(id, -32602, "缺少初始化参数");
-        continue;
-      }
-      initialized = true;
-      const serverInfo = { name: "agent-autoloop", version: "1.0.0" };
+    if (id === undefined) return;
+    if (method === "initialize") {
+      const serverInfo = { name: "agent-autoloop", version: versionName() };
       reply(id, { result: { protocolVersion: "2025-11-25", capabilities: { tools: {} }, serverInfo } });
     } else if (method === "ping") reply(id, { result: {} });
-    else if (!ready) refuse(id, -32600, "先完成 initialize");
     else if (method === "tools/list") reply(id, { result: { tools } });
-    else if (method === "tools/call") await answerCall(id, params);
+    // Each answers by itself, however long it takes: a client's ping has to get through meanwhile.
+    else if (method === "tools/call") void answerCall(id, params);
     else refuse(id, -32601, "没有这个方法");
-  }
+  });
 }

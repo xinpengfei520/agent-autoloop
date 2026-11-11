@@ -3,7 +3,8 @@ import { cardPage, PAGE_HEADERS, wordsPage } from "./card-page.ts";
 import { whose, type Environment } from "./credentials.ts";
 import { AuthError, Conflict, InputError, NotFound } from "./errors.ts";
 import type { Row, View } from "./evolve.ts";
-import { agentsOf, cancels, cardView, configuration } from "./query.ts";
+import { agentsOf, cancels, cardView, configuration, eventOutcome } from "./query.ts";
+import { isAsk } from "../protocol/validate.ts";
 
 export type Services = {
   now(): number;
@@ -31,6 +32,8 @@ class TooLarge extends Error {}
 
 async function readText(request: Request) {
   if (!request.body) return "";
+  // A little over the limit is read to its end: hanging up mid-upload can cost the client its 413.
+  if (Number(request.headers.get("content-length")) > 8 * MAX_BODY) throw new TooLarge();
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -100,10 +103,10 @@ async function cardAtLink(call: Call, linkToken: string) {
   const card = call.services.card(linkToken);
   const linksInUse = Object.values(rules.channels).some((channel) => channel.links);
   if (!card || !linksInUse) throw new NotFound("没有这张卡片");
-  if (request.method === "GET") return new Response(cardPage(cardView(card, environment)), { headers: PAGE_HEADERS });
   if (call.now - Date.parse(card.created_at) > LINK_LIFETIME) {
-    throw new AuthError(`这个链接过期了。在装它的电脑上运行 agent-autoloop answer ${card.id} 回答`);
+    throw new AuthError("这个链接过期了。在装它的电脑上运行 agent-autoloop status，还没答的卡片都在那里，可以接着回答");
   }
+  if (request.method === "GET") return new Response(cardPage(cardView(card, environment)), { headers: PAGE_HEADERS });
   const form = new URLSearchParams(await readText(request));
   const choice = form.has("choice") && { choice: Number(form.get("choice")) };
   act(call, "answer", card.id, { ...choice, text: form.get("text") ?? undefined, by: "链接" });
@@ -117,24 +120,38 @@ async function webhook(call: Call, source: string) {
 }
 
 async function tell(call: Call) {
-  const { rules, view } = call;
+  const { rules } = call;
   const source = keyHolder(call, "source");
   const worker = source ? null : keyHolder(call, "worker");
   if (!source && !worker) throw new AuthError("要来源或接单程序的密钥");
   const input = await readJson(call.request);
+  // A task elsewhere either tells you something or asks you, with a question just as a receipt's.
+  if (worker && input && typeof input === "object" && "ask" in input) return askAsTask(call, worker, input);
   const expected = source ? ["key", "text"] : ["key", "task", "text"];
   const hasExpected = input && typeof input === "object" && Object.keys(input).sort().join() === expected.join();
   const keyIsValid = typeof input?.key === "string" && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(input.key);
   const text = typeof input?.text === "string" ? input.text.trim() : "";
   if (!hasExpected || !keyIsValid || !text || [...text].length > 20_000) {
-    throw new InputError("要有正确的 key 和 text，接单程序还要写 task，text 最多 20000 字");
+    throw new InputError("要有正确的 key 和 text，接单程序还要写 task，text 最多 20000 字；问你的写 task 和 ask");
   }
   if (source) {
     return json(act(call, "tell", `source:${source}:${input.key}`, rules.sources[source]?.name ?? source, text));
   }
-  const task = rules.elsewhere.find((task) => task.name === input.task && agentsOf(view, worker!).includes(task.to));
-  if (!task) throw new AuthError("这台接单程序没有这个定时任务");
+  const task = taskOf(call, worker!, input.task);
   return json(act(call, "tell", `elsewhere:${task.name}:${input.key}`, task.name, text));
+}
+
+function taskOf({ rules, view }: Call, worker: string, name: unknown) {
+  const task = rules.elsewhere.find((task) => task.name === name && agentsOf(view, worker).includes(task.to));
+  if (!task) throw new AuthError("这台接单程序没有这个定时任务");
+  return task;
+}
+
+function askAsTask(call: Call, worker: string, input: Record<string, any>) {
+  if (Object.keys(input).sort().join() !== "ask,task" || !isAsk(input.ask)) {
+    throw new InputError("问你的只写 task 和 ask，ask 和回执里的一样：title、text、2 到 5 个 options");
+  }
+  return json(act(call, "ask", taskOf(call, worker, input.task).name, input.ask));
 }
 
 async function work(call: Call) {
@@ -189,6 +206,32 @@ async function cardAction(call: Call, id: number, action: string) {
   return json({ ok: true });
 }
 
+const CONTROL_FIELDS: Record<string, string[]> = { pause: ["reason", "until"], resume: [], run: ["subject", "reason"] };
+const CONTROL_INPUTS: Record<string, string> = { pause: "pauseRule", resume: "resumeRule", run: "runRule" };
+
+/** Pause, resume or run a rule now: the owner's, kept in the log. */
+async function control(call: Call, encoded: string, action: string) {
+  const holder = requireKey(call, "owner");
+  let name: string;
+  try {
+    name = decodeURIComponent(encoded);
+  } catch {
+    throw new InputError("名字不正确");
+  }
+  const text = await readText(call.request);
+  let given: unknown = {};
+  try {
+    if (text.trim()) given = JSON.parse(text);
+  } catch {
+    throw new InputError("不是 JSON");
+  }
+  if (!given || typeof given !== "object" || Array.isArray(given)) throw new InputError("要是一个 JSON 对象");
+  const unknown = Object.keys(given).filter((field) => !CONTROL_FIELDS[action].includes(field));
+  if (unknown.length) throw new InputError(`不认识的字段：${unknown.join("、")}`);
+  const type = CONTROL_INPUTS[action];
+  return json(action === "resume" ? act(call, type, name) : act(call, type, name, holder, given));
+}
+
 function state(call: Call) {
   requireKey(call, "owner");
   const before = call.url.searchParams.get("before");
@@ -210,14 +253,31 @@ async function route(call: Call): Promise<Response> {
   const { method } = request;
   const path = call.url.pathname;
   if (method === "GET" && path === "/healthz") return json({ ok: true, commit: services.commit });
-  const key = /^\/v1\/keys\/(source|worker|channel|owner)\/([a-z][a-z0-9-]*)$/.exec(path);
-  if (method === "DELETE" && key) return ownerAct(call, "removeKey", key[1], key[2]);
+  // A key's name is whatever `key new` was given; it only has to stay one path segment when encoded.
+  const key = /^\/v1\/keys\/(source|worker|channel|owner)\/([^/]+)$/.exec(path);
+  if (method === "DELETE" && key) {
+    requireKey(call, "owner");
+    let name: string;
+    try {
+      name = decodeURIComponent(key[2]);
+    } catch {
+      throw new InputError("密钥名字不正确");
+    }
+    return json({ ok: true, changed: act(call, "removeKey", key[1], name) });
+  }
   const link = CARD_LINK.exec(path);
   if (link && ["GET", "POST"].includes(method)) return cardAtLink(call, link[1]);
   const hook = /^\/v1\/in\/([a-z][a-z0-9-]*)$/.exec(path);
   if (method === "POST" && hook) return webhook(call, hook[1]);
   if (method === "POST" && path === "/v1/events") {
     return json(act(call, "ingest", requireKey(call, "source"), await readJson(request)));
+  }
+  const sent = /^\/v1\/events\/([1-9][0-9]*)$/.exec(path);
+  if (method === "GET" && sent) {
+    // Another source's event is as missing as one never sent: a source can't learn which numbers are taken.
+    const found = eventOutcome(call.view, requireKey(call, "source"), Number(sent[1]));
+    if (!found) throw new NotFound("没有这条事件");
+    return json(found);
   }
   if (method === "POST" && path === "/v1/tell") return tell(call);
   if (method === "GET" && path === "/v1/work") return work(call);
@@ -236,6 +296,8 @@ async function route(call: Call): Promise<Response> {
   if (method === "GET" && path === "/v1/cards/next") return nextCard(call);
   const card = /^\/v1\/cards\/([1-9][0-9]*)\/(delivered|failed|answer|resolve)$/.exec(path);
   if (method === "POST" && card) return cardAction(call, Number(card[1]), card[2]);
+  const ruleControl = /^\/v1\/rules\/([^/]+)\/(pause|resume|run)$/.exec(path);
+  if (method === "POST" && ruleControl) return control(call, ruleControl[1], ruleControl[2]);
   if (method === "GET" && path === "/v1/state") return state(call);
   if (method === "GET" && path === "/v1/stream") return stream(call);
   return json({ error: "没有这个地址" }, 404);

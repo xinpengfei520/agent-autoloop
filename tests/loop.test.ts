@@ -29,6 +29,7 @@ const bin = join(import.meta.dirname, "..", "bin", "agent-autoloop.ts");
 // `init` turns on the desktop channel: these stand in for the commands that would really show something.
 const notifiers = join(home, "notifiers");
 const notified = join(home, "notified.txt");
+const notifications = () => (existsSync(notified) ? readFileSync(notified, "utf8").trim().split("\n") : []);
 mkdirSync(notifiers);
 writeFileSync(join(notifiers, "launchctl"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
 for (const name of ["osascript", "notify-send"]) {
@@ -92,8 +93,10 @@ chmodSync(script, 0o755);
 
 let up: ReturnType<typeof spawn> | undefined;
 after(async () => {
-  up?.kill("SIGTERM");
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  if (up && up.exitCode === null && up.signalCode === null) {
+    up.kill("SIGTERM");
+    await new Promise((resolve) => up!.once("exit", resolve));
+  }
   rmSync(home, { recursive: true, force: true });
 });
 
@@ -113,9 +116,13 @@ test("one machine, one command: an event, a question, an answer, the work done",
 
   up = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", bin, "up"], { env, stdio: "ignore" });
   const url = `http://127.0.0.1:${port}`;
+  // `cli` holds up this process, so a connection kept open can time out at the hub unnoticed, and the next request on it
+  // is reset. Each request gets its own.
+  const get = (path: string, headers: Record<string, string> = {}) =>
+    fetch(`${url}${path}`, { headers: { connection: "close", ...headers } });
   for (let i = 0; i < 100; i++) {
     if (
-      await fetch(`${url}/healthz`).then(
+      await get("/healthz").then(
         (r) => r.ok,
         () => false,
       )
@@ -123,7 +130,7 @@ test("one machine, one command: an event, a question, an answer, the work done",
       break;
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  assert.equal((await (await fetch(`${url}/healthz`)).json()).ok, true);
+  assert.equal((await (await get("/healthz")).json()).ok, true);
   const second = cli("up");
   assert.equal(second.status, 1);
   assert.match(second.stderr, /已经在跑了/);
@@ -133,8 +140,7 @@ test("one machine, one command: an event, a question, an answer, the work done",
   assert.match(emitted.stdout, /交给了：试一下/);
 
   const config = JSON.parse(readFileSync(join(home, "config.json"), "utf8"));
-  const state = async () =>
-    (await fetch(`${url}/v1/state`, { headers: { authorization: `Bearer ${config.owner}` } })).json();
+  const state = async () => (await get("/v1/state", { authorization: `Bearer ${config.owner}` })).json();
   const until = async (done: (s: any) => boolean) => {
     for (let i = 0; i < 150; i++) {
       const now = await state();
@@ -153,6 +159,8 @@ test("one machine, one command: an event, a question, an answer, the work done",
   assert.match(waiting.stdout, /2\. 绿色（推荐）/);
   assert.match(waiting.stdout, new RegExp(`agent-autoloop answer ${card.id} `));
 
+  // The notifier runs on its own, and a card answered before it gets there isn't shown at all.
+  await until(() => notifications().length === 2);
   assert.equal(cli("answer", String(card.id), "7").status, 1, "there's no seventh option");
   const answered = cli("answer", String(card.id), "2");
   assert.equal(answered.status, 0, answered.stderr);
@@ -164,14 +172,14 @@ test("one machine, one command: an event, a question, an answer, the work done",
   assert.equal(finished.recentCards[0].result, "你选了绿色，做完了");
   assert.equal(finished.recentCards[0].by, "本人");
   assert.deepEqual(
-    readFileSync(notified, "utf8").trim().split("\n"),
+    notifications(),
     ["试跑：选一个颜色", "运行 agent-autoloop status 查看"],
     "once, and not for the answer",
   );
   assert.match(cli("answer", String(card.id), "1").stdout, /已经/);
 
   const status = cli("status");
-  assert.match(status.stdout, /在跑 0 · 排队 0 · 今天做完 2 · 等你 0/);
+  assert.match(status.stdout, /等你 0 · 在跑 0 · 排队 0 · 今天做完 2/);
   assert.match(status.stdout, /你选了绿色，做完了/);
   const told = spawnSync(process.execPath, ["--disable-warning=ExperimentalWarning", bin, "tell", "note-1"], {
     env,
@@ -195,7 +203,7 @@ test("one machine, one command: an event, a question, an answer, the work done",
   assert.match(resolved.stdout, /结案了/);
   assert.equal((await state()).recentCards.find((c: any) => c.id === Number(id)).result, "不试了");
   assert.equal(cli("resolve", id).status, 1, "a result has to be written");
-  assert.equal((await fetch(`${url}/`)).status, 404);
+  assert.equal((await get("/")).status, 404);
 });
 
 test("the user's Agents are shown how to set it up, when this is the install in its usual place, and nothing of theirs is touched", () => {

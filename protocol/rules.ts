@@ -32,6 +32,9 @@ const isId: Check = (value) => typeof value === "string" && ID.test(value);
 const isCount: Check = (value) => Number.isInteger(value) && (value as number) > 0;
 const isTypes: Check = (value) => isSomeWords(value) && (value as string[]).every((type) => TYPE_PATTERN.test(type));
 const isCron: Check = (value) => typeof value === "string" && parseCron(value) !== null;
+const isFolder: Check = (value) =>
+  typeof value === "string" && /^(~[/\\]|\/|[a-z]:[/\\]|\\\\[^\\]+\\[^\\]+)/i.test(value);
+const FOLDER = "要是绝对目录（如 ~/code、/srv/app、C:\\code 或 \\\\服务器\\共享目录）";
 
 function isKeyOf(table: object): Check {
   return (value) => typeof value === "string" && value in table;
@@ -71,13 +74,16 @@ function checkRule(issues: string[], rules: Rules, rule: Rule, names: Set<string
     ["name", isText, NOT_EMPTY],
     ["when", isObject, "要是一个对象"],
     ["to", isKeyOf(rules.agents), `不是已登记的 Agent：${isObject(rule) ? rule.to : ""}`],
-    ["cwd", (value) => typeof value === "string" && /^(~\/|\/)/.test(value), "要是以 ~/ 或 / 开头的目录"],
+    ["cwd", isFolder, FOLDER],
     ["skill", isText, NOT_EMPTY, true],
     ["prompt", isText, NOT_EMPTY, true],
     ["group", isText, NOT_EMPTY, true],
     ["parallel", isCount, "要是正整数", true],
+    ["maxActive", isCount, "要是正整数", true],
+    ["resume", (value) => typeof value === "boolean", "只能是 true 或 false", true],
     ["tell", (value) => TELLS.includes(value as string), `只能是 ${TELLS.join("、")}`, true],
     ["emits", isObject, "要是一个对象", true],
+    ["channels", isSomeWords, "要是通道编号的列表", true],
   ]);
   if (isObject(when) && "source" in when) {
     checkFields(issues, `${where}的 when `, when, [
@@ -102,6 +108,9 @@ function checkRule(issues: string[], rules: Rules, rule: Rule, names: Set<string
       ["types", isTypes, "要是事件类型的列表"],
     ]);
   }
+  for (const channel of isSomeWords(rule.channels) ? (rule.channels as string[]) : []) {
+    if (!Object.hasOwn(rules.channels, channel)) issues.push(`${where}的 channels 不是已登记的通道：${channel}`);
+  }
   rule.group ??= rule.name;
   rule.tell ??= "needed";
 }
@@ -120,6 +129,7 @@ export function parseRules(json: string, now: number, timezone: string): Rules {
     ["sources", isObject, "要是一个对象"],
     ["agents", isObject, "要是一个对象"],
     ["channels", isObject, "要是一个对象", true],
+    ["defaultChannels", isSomeWords, "要是通道编号的列表", true],
     ["rules", Array.isArray, "要是一个列表"],
     ["elsewhere", Array.isArray, "要是一个列表", true],
   ]);
@@ -146,6 +156,10 @@ export function parseRules(json: string, now: number, timezone: string): Rules {
       ["links", (value) => typeof value === "boolean", "要是 true 或 false", true],
     ]);
   }
+  for (const channel of rules.defaultChannels ?? []) {
+    if (!Object.hasOwn(rules.channels, channel))
+      issues.push(`rules.json 的 defaultChannels 不是已登记的通道：${channel}`);
+  }
   for (const [id, agent] of Object.entries(rules.agents)) {
     if (!ID.test(id)) issues.push(`Agent 的编号${ID_WORDS}：${id}`);
     checkFields(issues, `Agent ${id} `, agent, [
@@ -154,9 +168,12 @@ export function parseRules(json: string, now: number, timezone: string): Rules {
       ["use", isId, ID_WORDS],
       ["model", isText, NOT_EMPTY, true],
       ["effort", isText, NOT_EMPTY, true],
+      ["tier", isText, NOT_EMPTY, true],
       ["access", (value) => ACCESS.includes(value as string), `只能是 ${ACCESS.join("、")}`, true],
       ["command", isSomeWords, "要是命令行的列表", !isObject(agent) || agent.use !== "command"],
+      ["program", isText, "要是一个程序的路径", true],
       ["timeout", isCount, "要是正整数（分钟）", true],
+      ["maxActive", isCount, "要是正整数", true],
     ]);
     if (isObject(agent)) agent.access ??= "edit";
   }
@@ -178,7 +195,17 @@ export function parseRules(json: string, now: number, timezone: string): Rules {
       ["to", isKeyOf(rules.agents), "不是已登记的 Agent"],
       ["cron", isCron, "不是有效的 cron"],
       ["where", isText, NOT_EMPTY],
+      ["cwd", isFolder, FOLDER, true],
+      ["skill", isText, NOT_EMPTY, true],
+      ["prompt", isText, NOT_EMPTY, true],
     ]);
+    if (!isObject(task)) continue;
+    // Its answers go on like a round of a rule, so they need what a rule needs.
+    const words = task.skill !== undefined || task.prompt !== undefined;
+    if (words && task.cwd === undefined) issues.push(`定时任务「${name}」写了回答后照什么做，还要写 cwd：在哪接着做`);
+    if (task.cwd !== undefined && !words && rules.agents[task.to]?.use !== "command") {
+      issues.push(`定时任务「${name}」写了 cwd，skill 和 prompt 至少写一个：回答后照什么做`);
+    }
   }
   if (issues.length) throw new RulesError(issues);
   return rules;

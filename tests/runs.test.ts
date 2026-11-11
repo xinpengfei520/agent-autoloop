@@ -10,16 +10,20 @@
 // stale one is accepted after the run was handed out again; a replayed result isn't recognised, or a different one under an
 // old token is taken; a failed run's receipt takes effect (it will run again) beyond what it tells the owner; a worker
 // gone with work in hand frees its group while the work may still be going; cancelling frees the thread before the worker
-// has stopped; a retry doesn't get its own session back; retries overwrite usage or replayed results count it twice.
+// has stopped; a retry doesn't get its own session back; retries overwrite usage or replayed results count it twice; a run
+// that keeps failing goes on spending for good, stops without telling the owner, or takes newer events down with it.
+// A report of starting is taken whatever it holds, however long; stopping a run that isn't there or has ended crashes,
+// or marks it as stopping.
 // Reloading rules must not combine an old agent with a new folder, or change an already claimed job and its worker.
+// Rule and agent limits must hold across different subjects and rules, without losing their separate queued work.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { at, setup } from "./helpers.ts";
 
 setup("runs");
-const { ingest } = await import("../host/runtime.ts");
-const { claimNext, heartbeat, finish, started, sweep, cancel, cancels } = await import("../host/runtime.ts");
-const { AuthError, Conflict, InputError } = await import("../kernel/errors.ts");
+const { ingest } = await import("./hub.ts");
+const { claimNext, heartbeat, finish, started, sweep, cancel, cancels } = await import("./hub.ts");
+const { AuthError, Conflict, InputError, NotFound } = await import("../kernel/errors.ts");
 const { all, one, run } = await import("./storage.ts");
 
 const note = (n: number, step = "new") => ({
@@ -78,7 +82,7 @@ test("work goes only to its agent's worker, once, with the rule and what to read
 
 test("queued work takes the current agent and folder together; a held claim keeps its configuration", async () => {
   clean();
-  const hub = await import("../host/runtime.ts");
+  const hub = await import("./hub.ts");
   const before = hub.getView().get("config", "rules")!.value;
   const next = structuredClone(before);
   next.rules[0].to = "a2";
@@ -164,6 +168,58 @@ test("a parallel rule runs each subject on its own, no more than its number at o
   );
 });
 
+test("a rule limit leaves subjects separate while sharing a group with other rules", async () => {
+  clean();
+  const hub = await import("./hub.ts");
+  const before = hub.getView().get("config", "rules")!.value;
+  const next = structuredClone(before);
+  next.rules[0].maxActive = 1;
+  next.rules[2].group = next.rules[0].group;
+  next.rules[2].parallel = next.rules[0].parallel;
+  hub.execute("rules", [next], at(0));
+  try {
+    ingest("app", note(1), at(1));
+    ingest("app", note(2), at(2));
+    ingest("ops", alert("probe"), at(3));
+    const first = claim("w1", at(4))!;
+    assert.deepEqual(
+      first.context.events.map((event) => event.subject),
+      ["#1"],
+    );
+    assert.equal(claim("w1", at(4))?.rule.name, "告警也记一笔");
+    assert.equal(claim("w1", at(4)), null);
+    finish(first.run, first.token, { outcome: "done" }, at(5));
+    assert.deepEqual(
+      claim("w1", at(5))!.context.events.map((event) => event.subject),
+      ["#2"],
+    );
+  } finally {
+    hub.execute("rules", [before], at(6));
+  }
+});
+
+test("an agent limit holds across rules without blocking another agent on its worker", async () => {
+  clean();
+  const hub = await import("./hub.ts");
+  const before = hub.getView().get("config", "rules")!.value;
+  const next = structuredClone(before);
+  next.agents.a1.maxActive = 1;
+  next.agents.a2.worker = "w1";
+  hub.execute("rules", [next], at(0));
+  try {
+    ingest("app", note(1), at(1));
+    ingest("ops", alert("probe"), at(2));
+    const first = claim("w1", at(3))!;
+    assert.equal(first.rule.name, "意见");
+    assert.equal(claim("w1", at(3))?.rule.name, "告警");
+    assert.equal(claim("w1", at(3)), null);
+    finish(first.run, first.token, { outcome: "done" }, at(4));
+    assert.equal(claim("w1", at(4))?.rule.name, "告警也记一笔");
+  } finally {
+    hub.execute("rules", [before], at(5));
+  }
+});
+
 test("a subject's events join its waiting run, and wait while it runs; other subjects go on", () => {
   clean();
   ingest("app", note(1), at(0));
@@ -233,6 +289,48 @@ test("a failed run comes back later with what came in meanwhile, in its own sess
   job = claim("w1", at(80))!;
   finish(job.run, job.token, { outcome: "done", summary: "好了" }, at(81));
   assert.equal(told()[0].state, "closed", "once it has worked the failing card closes by itself");
+});
+
+test("after ten failures in a row a run stops, tells the owner once, and newer events still get done", () => {
+  clean();
+  ingest("app", note(1), at(0));
+  const step = 100;
+  let job = claim("w1", at(0))!;
+  const { run: id } = job;
+  for (let failure = 1; failure < 10; failure++) {
+    finish(id, job.token, { outcome: "failed", error: "没登录" }, at(failure * step));
+    assert.equal(state(id), "queued", `still retrying after failure ${failure}`);
+    job = claim("w1", at((failure + 1) * step - 1))!;
+    assert.equal(job.run, id);
+  }
+  ingest("app", note(1, "followup"), at(10 * step - 2));
+  finish(id, job.token, { outcome: "failed", error: "没登录。" }, at(10 * step));
+  assert.equal(state(id), "cancelled");
+  const stopped = one<{ attempts: number; error: string; summary: string; finished_at: string }>(
+    "SELECT attempts, error, summary, finished_at FROM runs WHERE id = ?",
+    [id],
+  )!;
+  assert.equal(stopped.attempts, 10);
+  assert.equal(stopped.error, "没登录");
+  assert.match(stopped.summary, /连续 10 次没跑成/);
+  assert.ok(stopped.finished_at);
+  const open = told().filter((card) => card.state === "open");
+  assert.deepEqual(
+    open.map((card) => card.key),
+    [`run:${id}:stopped`],
+    "the third-failure card has been replaced by this one",
+  );
+  assert.match(open[0].text, /连续 10 次.*卡在：没登录.*不再自动重试/);
+
+  const next = claim("w1", at(10 * step + 1))!;
+  assert.notEqual(next.run, id, "what came in meanwhile is its own run, with a clean count");
+  assert.equal(next.attempt, 1);
+  assert.deepEqual(
+    next.context.events.map((event) => event.type),
+    ["feedback.followup"],
+  );
+  finish(next.run, next.token, { outcome: "done", summary: "好了" }, at(10 * step + 2));
+  assert.equal(claim("w1", at(100 * step)), null, "nothing is left to run again by itself");
 });
 
 test("the owner is told what the rule says: needed only with a card, always every time, never only what blocks work", () => {
@@ -484,6 +582,37 @@ test("cancelling a waiting run ends it; cancelling a running one holds its threa
   assert.equal(state(going.run), "cancelled");
   assert.deepEqual(cancels("w2"), []);
   assert.ok(claim("w2", at(5)));
+});
+
+test("stopping a run that isn't there, or has already ended, is refused and changes nothing", () => {
+  clean();
+  assert.throws(() => cancel(9999, at(0)), NotFound);
+  ingest("ops", alert("x"), at(0));
+  const job = claim("w2", at(0))!;
+  finish(job.run, job.token, { outcome: "done", summary: "好了" }, at(1));
+  assert.throws(() => cancel(job.run, at(2)), InputError);
+  const row = one<{ state: string; cancel_at: string | null }>("SELECT state, cancel_at FROM runs WHERE id = ?", [
+    job.run,
+  ])!;
+  assert.deepEqual([row.state, row.cancel_at], ["done", null]);
+});
+
+test("a report of starting is bounded, and a refused one changes nothing", () => {
+  clean();
+  ingest("ops", alert("x"), at(0));
+  const job = claim("w2", at(0))!;
+  const reported = () => {
+    const row = one<{ session: string | null; link: string | null }>("SELECT session, link FROM runs WHERE id = ?", [
+      job.run,
+    ])!;
+    return [row.session, row.link];
+  };
+  for (const bad of [{ session: 42 }, { link: {} }, { session: "s".repeat(501) }, { link: "l".repeat(501) }])
+    assert.throws(() => started(job.run, job.token, bad, at(1)), InputError, JSON.stringify(bad));
+  assert.deepEqual(reported(), [null, null]);
+  // The limit itself is allowed.
+  started(job.run, job.token, { session: "s".repeat(500), link: "l".repeat(500) }, at(1));
+  assert.deepEqual(reported(), ["s".repeat(500), "l".repeat(500)]);
 });
 
 test("a run's usage and session are kept", () => {
